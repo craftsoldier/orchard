@@ -16,7 +16,10 @@ use crate::{
         FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey, SpendValidatingKey,
         SpendingKey,
     },
-    note::{ExtractedNoteCommitment, Note, NoteVersion, Nullifier, Rho, TransmittedNoteCiphertext},
+    note::{
+        ExtractedNoteCommitment, Note, NoteVersion, Nullifier, RandomSeed, RandomSeedBytes, Rho,
+        TransmittedNoteCiphertext,
+    },
     note_encryption::{NoteBytesData, OrchardNoteEncryption, ENC_CIPHERTEXT_SIZE},
     primitives::redpallas::{self, Binding, SpendAuth},
     tree::{Anchor, MerklePath},
@@ -202,6 +205,12 @@ pub enum BuildError {
     /// digest — and hence every signature — excludes the bundle anchor (the V6 formats;
     /// [ZIP 374](https://zips.z.cash/zip-0374)).
     AnchorDeferralUnsupported,
+    /// An invalid `rseed` was provided for an output: it does not yield a valid ephemeral
+    /// secret key for the action the output was placed in.
+    InvalidRandomSeed,
+    /// The components of an output with a provided `rseed` do not produce a valid note
+    /// commitment.
+    InvalidOutputNote,
 }
 
 impl fmt::Display for BuildError {
@@ -251,6 +260,12 @@ impl fmt::Display for BuildError {
             AnchorDeferralUnsupported => f.write_str(
                 "Anchors can be deferred only for bundle formats whose txid digest \
                  excludes the anchor.",
+            ),
+            InvalidRandomSeed => f.write_str(
+                "An output's provided rseed is invalid for the action the output was placed in.",
+            ),
+            InvalidOutputNote => f.write_str(
+                "An output with a provided rseed does not produce a valid note commitment.",
             ),
         }
     }
@@ -485,6 +500,13 @@ pub struct OutputInfo {
     value: NoteValue,
     memo: [u8; 512],
     note_version: NoteVersion,
+    /// When set, the output's note is constructed from this `rseed` instead of from a
+    /// freshly sampled one.
+    ///
+    /// The seed is held unvalidated because a [`RandomSeed`] is only valid relative to the
+    /// note's `rho`, which is not known until `build_bundle` has placed the output in an
+    /// action; `build_bundle` validates it there, before any action is built.
+    rseed: Option<RandomSeedBytes>,
     /// When set, `build` fills `enc_ciphertext` with random bytes instead of encrypting the
     /// note to `recipient`. This is used only for the zero-valued output that a builder with
     /// cross-address actions disabled pairs with a real external-scope spend, which is addressed
@@ -515,8 +537,45 @@ impl OutputInfo {
             value,
             memo,
             note_version,
+            rseed: None,
             randomized_ciphertext: false,
         }
+    }
+
+    /// Constructs an output whose note is built from the given `rseed` instead of from a
+    /// freshly sampled one (see [`Builder::add_output_with_rseed`]).
+    fn new_with_rseed(
+        ovk: Option<OutgoingViewingKey>,
+        recipient: Address,
+        value: NoteValue,
+        note_version: NoteVersion,
+        memo: [u8; 512],
+        rseed: RandomSeedBytes,
+    ) -> Self {
+        Self {
+            ovk,
+            recipient,
+            value,
+            memo,
+            note_version,
+            rseed: Some(rseed),
+            randomized_ciphertext: false,
+        }
+    }
+
+    /// Constructs this output's note for the given `rho` from its provided `rseed`, the
+    /// same way a recipient reconstructs a note from its decrypted note plaintext.
+    ///
+    /// Returns `None` if no `rseed` was provided for this output.
+    fn note_from_provided_rseed(&self, rho: Rho) -> Option<Result<Note, BuildError>> {
+        self.rseed.map(|rseed| {
+            let rseed = RandomSeed::from_bytes(*rseed.as_bytes(), &rho)
+                .into_option()
+                .ok_or(BuildError::InvalidRandomSeed)?;
+            Note::from_parts(self.recipient, self.value, rho, rseed, self.note_version)
+                .into_option()
+                .ok_or(BuildError::InvalidOutputNote)
+        })
     }
 
     /// Constructs the zero-valued output that a builder with cross-address actions
@@ -537,6 +596,7 @@ impl OutputInfo {
             value: NoteValue::ZERO,
             memo: [0u8; 512],
             note_version,
+            rseed: None,
             randomized_ciphertext: matches!(spent_scope, Scope::External),
         }
     }
@@ -563,7 +623,11 @@ impl OutputInfo {
         mut rng: impl Rng,
     ) -> (Note, ExtractedNoteCommitment, TransmittedNoteCiphertext) {
         let rho = Rho::from_nf_old(nf_old);
-        let note = Note::new(self.recipient, self.value, rho, self.note_version, &mut rng);
+        let note = match self.note_from_provided_rseed(rho) {
+            None => Note::new(self.recipient, self.value, rho, self.note_version, &mut rng),
+            Some(note) => note
+                .expect("a provided rseed is validated against its action's rho in build_bundle"),
+        };
         let cm_new = note.commitment();
         let cmx = cm_new.into();
 
@@ -689,6 +753,21 @@ impl ActionInfo {
     /// Returns the value sum for this action.
     fn value_sum(&self) -> ValueSum {
         self.spend.note.value() - self.output.value
+    }
+
+    /// Checks that this action's output, if an `rseed` was provided for it, yields a valid
+    /// note for the `rho` that this action's spend gives it.
+    fn check_provided_rseed(&self) -> Result<(), BuildError> {
+        match self.output.rseed {
+            None => Ok(()),
+            Some(_) => {
+                let rho = Rho::from_nf_old(self.spend.note.nullifier(&self.spend.fvk));
+                self.output
+                    .note_from_provided_rseed(rho)
+                    .transpose()
+                    .map(|_| ())
+            }
+        }
     }
 
     /// Builds the action for a given circuit version.
@@ -1032,6 +1111,72 @@ impl Builder {
             value,
             self.note_version(),
             memo,
+        ));
+
+        Ok(())
+    }
+
+    /// Adds an address which will receive funds in this transaction, in a note that is
+    /// constructed from the given `rseed` instead of from a freshly sampled one.
+    ///
+    /// The note is constructed from `rseed` the same way a recipient reconstructs it from
+    /// the decrypted note plaintext: $\mathsf{esk}$, $\psi$ and $\mathsf{rcm}$ are derived
+    /// from `rseed` as [ZIP 212] and [ZIP 2005] specify for the bundle's note plaintext
+    /// lead byte. The output is therefore an ordinary one to its recipient and to the
+    /// holder of `ovk`, and a PCZT carries it in its existing `rseed` field. What it adds
+    /// is that the note commitment is a function of a seed the caller chose.
+    ///
+    /// # Caveats
+    ///
+    /// This departs from the requirement of [ZIP 212] that the sender samples `rseed`
+    /// uniformly at random, and so gives up what that randomness provides:
+    ///
+    /// - Anyone who knows `rseed` learns what the sender of the note knows. From `rseed`
+    ///   and the nullifier revealed by the output's action they can derive
+    ///   $\mathsf{esk}$, and with the recipient's address decrypt the note and its memo;
+    ///   this holds even when `ovk` is `None`. A caller that needs the note to stay
+    ///   private MUST derive `rseed` from a secret with at least 256 bits of entropy.
+    /// - The note encryption key is a function of `rseed`, the recipient, and the
+    ///   nullifier revealed by the output's action. Two outputs that agree on all three
+    ///   and differ in value or memo encrypt two plaintexts under one key. The nullifier
+    ///   can only agree if both actions spend the same note, as when a transaction is
+    ///   built again; a caller MUST NOT then change the value or the memo.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Builder::add_output`].
+    ///
+    /// Whether `rseed` yields a valid note depends on the action the output is placed in,
+    /// so it is checked when the bundle is built: [`Builder::build`] and
+    /// [`Builder::build_for_pczt`] return [`BuildError::InvalidRandomSeed`] if `rseed`
+    /// does not yield a valid $\mathsf{esk}$, or [`BuildError::InvalidOutputNote`] if
+    /// the note has no valid commitment. Each occurs with negligible probability.
+    ///
+    /// [ZIP 212]: https://zips.z.cash/zip-0212
+    /// [ZIP 2005]: https://zips.z.cash/zip-2005
+    #[cfg_attr(feature = "unstable-bound-notes", visibility::make(pub))]
+    pub(crate) fn add_output_with_rseed(
+        &mut self,
+        ovk: Option<OutgoingViewingKey>,
+        recipient: Address,
+        value: NoteValue,
+        memo: [u8; 512],
+        rseed: RandomSeedBytes,
+    ) -> Result<(), OutputError> {
+        if !self.flags.outputs_enabled() {
+            return Err(OutputError::OutputsDisabled);
+        }
+        if !self.flags.cross_address_enabled() {
+            return Err(OutputError::CrossAddressDisabled);
+        }
+
+        self.outputs.push(OutputInfo::new_with_rseed(
+            ovk,
+            recipient,
+            value,
+            self.note_version(),
+            memo,
+            rseed,
         ));
 
         Ok(())
@@ -1529,6 +1674,14 @@ fn build_bundle<B, R: Rng>(
 
         (pre_actions, bundle_meta)
     };
+
+    // A provided `rseed` is only valid relative to the `rho` of the action its output was
+    // placed in, which is fixed now that the spends and outputs are paired. Validate it
+    // here, for every build path and before any action is built, so that building the
+    // actions cannot fail on it.
+    pre_actions
+        .iter()
+        .try_for_each(ActionInfo::check_provided_rseed)?;
 
     // Determine the value balance for this bundle, ensuring it is valid.
     let value_balance = pre_actions
@@ -2186,7 +2339,7 @@ mod tests {
         keys::{
             FullViewingKey, PreparedIncomingViewingKey, Scope, SpendAuthorizingKey, SpendingKey,
         },
-        note::{NoteVersion, Nullifier, Rho},
+        note::{ExtractedNoteCommitment, NoteVersion, Nullifier, RandomSeed, RandomSeedBytes, Rho},
         note_encryption::OrchardDomain,
         pczt::{ProverError, VerifyError},
         tree::{MerklePath, EMPTY_ROOTS},
@@ -3312,5 +3465,361 @@ mod tests {
         let pk = crate::cached_test_keys(OrchardCircuitVersion::PostNu6_3).proving_key();
         let bundle = build_restricted(&mut rng);
         bundle.create_proof(pk, &mut rng).unwrap();
+    }
+
+    /// The size in bytes of a note's memo field.
+    const MEMO_SIZE: usize = 512;
+
+    /// The value, in zatoshis, of the note that the provided-`rseed` tests spend and create.
+    const PROVIDED_RSEED_NOTE_ZATOSHIS: u64 = 10_000;
+
+    proptest! {
+        /// Providing the `rseed` that the builder would have sampled yields the identical
+        /// action. The provided-`rseed` path therefore differs from the sampled one only in
+        /// where the seed comes from.
+        #[test]
+        fn provided_rseed_reproduces_the_sampled_output(
+            sk in crate::keys::testing::arb_spending_key(),
+            memo in prop::collection::vec(any::<u8>(), MEMO_SIZE),
+            bundle_version in crate::bundle::testing::arb_bundle_version().prop_filter(
+                "ordinary outputs require cross-address transfers",
+                BundleVersion::permits_cross_address_transfers,
+            ),
+            build_seed in any::<[u8; 32]>(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+            let recipient = fvk.address_at(0u32, Scope::External);
+            let ovk = fvk.to_ovk(Scope::External);
+            let value = NoteValue::from_raw(PROVIDED_RSEED_NOTE_ZATOSHIS);
+            let memo: [u8; MEMO_SIZE] = memo.try_into().unwrap();
+            let new_builder = || {
+                Builder::new(
+                    BundleType::DEFAULT,
+                    bundle_version,
+                    bundle_version.default_flags(),
+                    EMPTY_ROOTS[MERKLE_DEPTH_ORCHARD].into(),
+                )
+                .unwrap()
+            };
+
+            let mut sampling = new_builder();
+            sampling.add_output(Some(ovk.clone()), recipient, value, memo).unwrap();
+            let (sampled_bundle, sampled_meta) = sampling
+                .build_for_pczt(StdRng::from_seed(build_seed))
+                .unwrap();
+            let action_idx = sampled_meta.output_action_index(0).unwrap();
+            let sampled = &sampled_bundle.actions[action_idx];
+            let sampled_rseed = sampled.output.rseed.unwrap();
+
+            let mut providing = new_builder();
+            providing
+                .add_output_with_rseed(
+                    Some(ovk),
+                    recipient,
+                    value,
+                    memo,
+                    RandomSeedBytes::from_bytes(*sampled_rseed.as_bytes()),
+                )
+                .unwrap();
+            let (provided_bundle, provided_meta) = providing
+                .build_for_pczt(StdRng::from_seed(build_seed))
+                .unwrap();
+            prop_assert_eq!(&provided_meta, &sampled_meta);
+            let provided = &provided_bundle.actions[action_idx];
+
+            prop_assert_eq!(provided.spend.nullifier, sampled.spend.nullifier);
+            prop_assert_eq!(
+                <[u8; 32]>::from(&provided.spend.rk),
+                <[u8; 32]>::from(&sampled.spend.rk)
+            );
+            prop_assert_eq!(provided.cv_net.to_bytes(), sampled.cv_net.to_bytes());
+            prop_assert_eq!(provided.output.cmx.to_bytes(), sampled.output.cmx.to_bytes());
+            prop_assert_eq!(
+                provided.output.encrypted_note.epk_bytes,
+                sampled.output.encrypted_note.epk_bytes
+            );
+            prop_assert_eq!(
+                provided.output.encrypted_note.enc_ciphertext.0,
+                sampled.output.encrypted_note.enc_ciphertext.0
+            );
+            prop_assert_eq!(
+                provided.output.encrypted_note.out_ciphertext,
+                sampled.output.encrypted_note.out_ciphertext
+            );
+        }
+    }
+
+    proptest! {
+        // Each case builds a bundle around a real spend, which dominates the running time,
+        // and the property does not depend on which note is spent, so a handful of cases
+        // suffices.
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// An output with a provided `rseed`, built alongside a real spend, is an ordinary
+        /// note to its recipient and to the holder of its outgoing viewing key, and its
+        /// commitment is recomputable from the `rseed` without a decryption key.
+        #[test]
+        fn provided_rseed_output_is_an_ordinary_note(
+            (bundle_version, (sk, spent_note, merkle_path, anchor)) in
+                crate::bundle::testing::arb_bundle_version()
+                    .prop_filter(
+                        "ordinary outputs require cross-address transfers",
+                        BundleVersion::permits_cross_address_transfers,
+                    )
+                    .prop_flat_map(|bundle_version| (
+                        Just(bundle_version),
+                        testing::arb_spendable_note(
+                            NoteValue::from_raw(PROVIDED_RSEED_NOTE_ZATOSHIS),
+                            bundle_version.note_version(),
+                        ),
+                    )),
+            memo in prop::collection::vec(any::<u8>(), MEMO_SIZE),
+            rseed in crate::note::testing::arb_rseed_bytes(),
+            build_seed in any::<[u8; 32]>(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+            let recipient = spent_note.recipient();
+            let value = spent_note.value();
+            let ovk = fvk.to_ovk(Scope::External);
+            let memo: [u8; MEMO_SIZE] = memo.try_into().unwrap();
+
+            let mut builder = Builder::new(
+                BundleType::DEFAULT,
+                bundle_version,
+                bundle_version.default_flags(),
+                anchor,
+            )
+            .unwrap();
+            builder.add_spend(fvk.clone(), spent_note, merkle_path).unwrap();
+            builder
+                .add_output_with_rseed(Some(ovk.clone()), recipient, value, memo, rseed)
+                .unwrap();
+            let (bundle, meta) = builder
+                .build::<i64>(StdRng::from_seed(build_seed))
+                .unwrap()
+                .unwrap();
+            let action_idx = meta.output_action_index(0).unwrap();
+            let action = bundle.actions().get(action_idx).unwrap();
+
+            // A party holding no decryption key reconstructs the note from the action's
+            // `rho`, the recipient, the value and the `rseed`, and it has the action's
+            // note commitment.
+            let rho = action.rho();
+            let expected = Note::from_parts(
+                recipient,
+                value,
+                rho,
+                RandomSeed::from_bytes(*rseed.as_bytes(), &rho).unwrap(),
+                bundle_version.note_version(),
+            )
+            .unwrap();
+            prop_assert_eq!(
+                ExtractedNoteCommitment::from(expected.commitment()).to_bytes(),
+                action.cmx().to_bytes()
+            );
+
+            // The recipient decrypts that note, under the note encryption domain for the
+            // bundle's note plaintext lead byte, and reads back the provided `rseed`.
+            let decrypted = bundle.decrypt_output_with_key(action_idx, &fvk.to_ivk(Scope::External));
+            prop_assert!(decrypted.is_some());
+            let (note, decrypted_to, decrypted_memo) = decrypted.unwrap();
+            prop_assert_eq!(note, expected);
+            prop_assert_eq!(note.rseed().as_bytes(), rseed.as_bytes());
+            prop_assert_eq!(decrypted_to, recipient);
+            prop_assert_eq!(decrypted_memo, memo);
+
+            // The holder of the outgoing viewing key recovers the same note.
+            let recovered = bundle.recover_output_with_ovk(action_idx, &ovk);
+            prop_assert!(recovered.is_some());
+            let (note, recovered_to, recovered_memo) = recovered.unwrap();
+            prop_assert_eq!(note, expected);
+            prop_assert_eq!(note.rseed().as_bytes(), rseed.as_bytes());
+            prop_assert_eq!(recovered_to, recipient);
+            prop_assert_eq!(recovered_memo, memo);
+        }
+    }
+
+    proptest! {
+        /// A PCZT carries a provided `rseed` in the output's existing `rseed` field, and the
+        /// output passes the checks the PCZT roles apply to any output.
+        #[test]
+        fn provided_rseed_output_verifies_in_a_pczt(
+            sk in crate::keys::testing::arb_spending_key(),
+            memo in prop::collection::vec(any::<u8>(), MEMO_SIZE),
+            rseed in crate::note::testing::arb_rseed_bytes(),
+            bundle_version in crate::bundle::testing::arb_bundle_version().prop_filter(
+                "ordinary outputs require cross-address transfers",
+                BundleVersion::permits_cross_address_transfers,
+            ),
+            build_seed in any::<[u8; 32]>(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+            let recipient = fvk.address_at(0u32, Scope::External);
+            let value = NoteValue::from_raw(PROVIDED_RSEED_NOTE_ZATOSHIS);
+            let memo: [u8; MEMO_SIZE] = memo.try_into().unwrap();
+
+            let mut builder = Builder::new(
+                BundleType::DEFAULT,
+                bundle_version,
+                bundle_version.default_flags(),
+                EMPTY_ROOTS[MERKLE_DEPTH_ORCHARD].into(),
+            )
+            .unwrap();
+            builder
+                .add_output_with_rseed(None, recipient, value, memo, rseed)
+                .unwrap();
+            let (pczt_bundle, meta) = builder
+                .build_for_pczt(StdRng::from_seed(build_seed))
+                .unwrap();
+            let action = &pczt_bundle.actions[meta.output_action_index(0).unwrap()];
+
+            prop_assert_eq!(
+                action.output.rseed.as_ref().map(RandomSeed::as_bytes),
+                Some(rseed.as_bytes())
+            );
+            prop_assert!(action.output.verify_note_commitment(&action.spend).is_ok());
+
+            let ivk = PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External));
+            let decrypted = action.decrypt_output_with_ivk(&ivk, bundle_version);
+            prop_assert!(matches!(decrypted, Ok(Some(_))));
+            let (note, decrypted_to, decrypted_memo) = decrypted.unwrap().unwrap();
+            prop_assert_eq!(note.rseed().as_bytes(), rseed.as_bytes());
+            prop_assert_eq!(note.value(), value);
+            prop_assert_eq!(decrypted_to, recipient);
+            prop_assert_eq!(decrypted_memo, memo);
+        }
+    }
+
+    proptest! {
+        /// Providing an `rseed` does not change when an output may be added: under any
+        /// bundle version and flags, `add_output_with_rseed` returns what `add_output` does.
+        #[test]
+        fn add_output_with_rseed_is_rejected_exactly_when_add_output_is(
+            sk in crate::keys::testing::arb_spending_key(),
+            rseed in crate::note::testing::arb_rseed_bytes(),
+            bundle_version in crate::bundle::testing::arb_bundle_version(),
+            spends_enabled in any::<bool>(),
+            outputs_enabled in any::<bool>(),
+            cross_address_enabled in any::<bool>(),
+        ) {
+            let recipient = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
+            let value = NoteValue::from_raw(PROVIDED_RSEED_NOTE_ZATOSHIS);
+            let flags = Flags::from_parts(spends_enabled, outputs_enabled, cross_address_enabled);
+            let new_builder = || {
+                Builder::new(
+                    BundleType::DEFAULT,
+                    bundle_version,
+                    flags,
+                    EMPTY_ROOTS[MERKLE_DEPTH_ORCHARD].into(),
+                )
+            };
+            prop_assume!(new_builder().is_ok());
+
+            prop_assert_eq!(
+                new_builder()
+                    .unwrap()
+                    .add_output_with_rseed(None, recipient, value, [0u8; MEMO_SIZE], rseed),
+                new_builder()
+                    .unwrap()
+                    .add_output(None, recipient, value, [0u8; MEMO_SIZE])
+            );
+        }
+    }
+
+    /// A note created from a provided `rseed` is spendable, and its successor can be created
+    /// from another provided `rseed`: both bundles prove, and their proofs and signatures
+    /// verify.
+    #[test]
+    fn provided_rseed_bundle_chain_proves_and_verifies() {
+        let bundle_version = BundleVersion::ironwood_v3();
+        let keys = crate::cached_test_keys(bundle_version.circuit_version());
+        let (pk, vk) = (keys.proving_key(), keys.verifying_key());
+        let mut rng = UnwrapErr(SysRng);
+        let sighash = [0; 32];
+
+        let sk = SpendingKey::random(&mut rng);
+        let fvk = FullViewingKey::from(&sk);
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let value = NoteValue::from_raw(PROVIDED_RSEED_NOTE_ZATOSHIS);
+        let mut provided_rseed = || {
+            let mut bytes = [0u8; 32];
+            rng.fill_bytes(&mut bytes);
+            RandomSeedBytes::from_bytes(bytes)
+        };
+        let (first_rseed, second_rseed) = (provided_rseed(), provided_rseed());
+
+        let assert_verifies = |bundle: &Bundle<Authorized, i64>| {
+            assert!(bundle.verify_proof(vk).is_ok());
+            for action in bundle.actions() {
+                assert_eq!(action.rk().verify(&sighash, action.authorization()), Ok(()));
+            }
+            assert_eq!(
+                bundle
+                    .binding_validating_key()
+                    .verify(&sighash, bundle.authorization().binding_signature()),
+                Ok(())
+            );
+        };
+
+        // Create a note from the first provided `rseed`.
+        let mut builder = Builder::new(
+            BundleType::DEFAULT,
+            bundle_version,
+            bundle_version.default_flags(),
+            EMPTY_ROOTS[MERKLE_DEPTH_ORCHARD].into(),
+        )
+        .unwrap();
+        builder
+            .add_output_with_rseed(None, recipient, value, [0u8; MEMO_SIZE], first_rseed)
+            .unwrap();
+        let (unauthorized, meta) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+        let first_bundle = unauthorized
+            .create_proof(pk, &mut rng)
+            .unwrap()
+            .apply_signatures(rng, sighash, &[])
+            .unwrap();
+        assert_verifies(&first_bundle);
+        let (first_note, _, _) = first_bundle
+            .decrypt_output_with_key(
+                meta.output_action_index(0).unwrap(),
+                &fvk.to_ivk(Scope::External),
+            )
+            .unwrap();
+        assert_eq!(first_note.rseed().as_bytes(), first_rseed.as_bytes());
+
+        // Spend that note, and create its successor from the second provided `rseed`.
+        let merkle_path = MerklePath::dummy(&mut rng);
+        let anchor = merkle_path.root(first_note.commitment().into());
+        let mut builder = Builder::new(
+            BundleType::DEFAULT,
+            bundle_version,
+            bundle_version.default_flags(),
+            anchor,
+        )
+        .unwrap();
+        builder
+            .add_spend(fvk.clone(), first_note, merkle_path)
+            .unwrap();
+        builder
+            .add_output_with_rseed(None, recipient, value, [0u8; MEMO_SIZE], second_rseed)
+            .unwrap();
+        let (unauthorized, meta) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+        let second_bundle = unauthorized
+            .create_proof(pk, &mut rng)
+            .unwrap()
+            .apply_signatures(rng, sighash, &[SpendAuthorizingKey::from(&sk)])
+            .unwrap();
+        assert_verifies(&second_bundle);
+        assert_eq!(
+            second_bundle.actions()[meta.spend_action_index(0).unwrap()].nullifier(),
+            &first_note.nullifier(&fvk)
+        );
+        let (second_note, _, _) = second_bundle
+            .decrypt_output_with_key(
+                meta.output_action_index(0).unwrap(),
+                &fvk.to_ivk(Scope::External),
+            )
+            .unwrap();
+        assert_eq!(second_note.rseed().as_bytes(), second_rseed.as_bytes());
     }
 }
