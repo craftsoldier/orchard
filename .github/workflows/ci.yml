@@ -28,6 +28,10 @@ jobs:
       # type-check it.
       - name: Compile-check the verifier-fingerprint capture module
         run: cargo test --features verifier-fingerprint --no-run --verbose
+      # The `unstable-bound-notes` tests are behind an opt-in feature, so the default-feature
+      # run above never executes them.
+      - name: Run the unstable-bound-notes tests
+        run: cargo test --features unstable-bound-notes --lib supplied_rseed --verbose
       - name: Verify working directory is clean
         run: git diff --exit-code
 

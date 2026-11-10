@@ -7,6 +7,13 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `unstable-bound-notes` feature flag, which lets a caller supply the `rseed` of an
+  output instead of having the builder sample it, and provides:
+  - `orchard::builder::Builder::add_output_with_rseed`
+  - `orchard::builder::OutputInfo::with_rseed`
+- `orchard::builder::BuildError::InvalidOutputNote`
+
 ## [0.16.0] - 2026-09-29
 
 ### Added

@@ -16,7 +16,10 @@ use crate::{
         FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey, SpendValidatingKey,
         SpendingKey,
     },
-    note::{ExtractedNoteCommitment, Note, NoteVersion, Nullifier, Rho, TransmittedNoteCiphertext},
+    note::{
+        ExtractedNoteCommitment, Note, NoteVersion, Nullifier, RandomSeed, Rho,
+        TransmittedNoteCiphertext,
+    },
     note_encryption::{NoteBytesData, OrchardNoteEncryption, ENC_CIPHERTEXT_SIZE},
     primitives::redpallas::{self, Binding, SpendAuth},
     tree::{Anchor, MerklePath},
@@ -202,6 +205,10 @@ pub enum BuildError {
     /// digest — and hence every signature — excludes the bundle anchor (the V6 formats;
     /// [ZIP 374](https://zips.z.cash/zip-0374)).
     AnchorDeferralUnsupported,
+    /// An output was added with a caller-supplied `rseed` that does not yield a valid
+    /// note for the action it was placed in: the derived `esk` is zero, or the note
+    /// commitment is undefined. Each has negligible probability for a given `rseed`.
+    InvalidOutputNote,
 }
 
 impl fmt::Display for BuildError {
@@ -252,6 +259,9 @@ impl fmt::Display for BuildError {
                 "Anchors can be deferred only for bundle formats whose txid digest \
                  excludes the anchor.",
             ),
+            InvalidOutputNote => {
+                f.write_str("A caller-supplied rseed does not yield a valid output note.")
+            }
         }
     }
 }
@@ -485,6 +495,10 @@ pub struct OutputInfo {
     value: NoteValue,
     memo: [u8; 512],
     note_version: NoteVersion,
+    /// When set, `build` constructs the output's note from this `rseed` instead of sampling
+    /// one. It is held as raw bytes because a [`RandomSeed`] is only valid for a given `rho`,
+    /// which is not known until the output has been placed in an action.
+    rseed: Option<[u8; 32]>,
     /// When set, `build` fills `enc_ciphertext` with random bytes instead of encrypting the
     /// note to `recipient`. This is used only for the zero-valued output that a builder with
     /// cross-address actions disabled pairs with a real external-scope spend, which is addressed
@@ -515,8 +529,19 @@ impl OutputInfo {
             value,
             memo,
             note_version,
+            rseed: None,
             randomized_ciphertext: false,
         }
+    }
+
+    /// Makes this output's note use `rseed` instead of a freshly sampled seed.
+    ///
+    /// See [`Builder::add_output_with_rseed`] for the consequences of supplying the seed.
+    #[cfg(feature = "unstable-bound-notes")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-bound-notes")))]
+    pub fn with_rseed(mut self, rseed: [u8; 32]) -> Self {
+        self.rseed = Some(rseed);
+        self
     }
 
     /// Constructs the zero-valued output that a builder with cross-address actions
@@ -537,6 +562,7 @@ impl OutputInfo {
             value: NoteValue::ZERO,
             memo: [0u8; 512],
             note_version,
+            rseed: None,
             randomized_ciphertext: matches!(spent_scope, Scope::External),
         }
     }
@@ -561,9 +587,21 @@ impl OutputInfo {
         cv_net: &ValueCommitment,
         nf_old: Nullifier,
         mut rng: impl Rng,
-    ) -> (Note, ExtractedNoteCommitment, TransmittedNoteCiphertext) {
+    ) -> Result<(Note, ExtractedNoteCommitment, TransmittedNoteCiphertext), BuildError> {
         let rho = Rho::from_nf_old(nf_old);
-        let note = Note::new(self.recipient, self.value, rho, self.note_version, &mut rng);
+        let note = match self.rseed {
+            None => Note::new(self.recipient, self.value, rho, self.note_version, &mut rng),
+            // A supplied seed cannot be resampled, so the two conditions that `Note::new`
+            // retries past are reported instead. No test reaches this error: producing a
+            // seed that triggers it requires a preimage of `PRF^expand`.
+            Some(rseed) => RandomSeed::from_bytes(rseed, &rho)
+                .into_option()
+                .and_then(|rseed| {
+                    Note::from_parts(self.recipient, self.value, rho, rseed, self.note_version)
+                        .into_option()
+                })
+                .ok_or(BuildError::InvalidOutputNote)?,
+        };
         let cm_new = note.commitment();
         let cmx = cm_new.into();
 
@@ -592,7 +630,7 @@ impl OutputInfo {
             out_ciphertext: encryptor.encrypt_outgoing_plaintext(cv_net, &cmx, &mut rng),
         };
 
-        (note, cmx, encrypted_note)
+        Ok((note, cmx, encrypted_note))
     }
 
     fn into_pczt(
@@ -600,10 +638,10 @@ impl OutputInfo {
         cv_net: &ValueCommitment,
         nf_old: Nullifier,
         rng: impl Rng,
-    ) -> crate::pczt::Output {
-        let (note, cmx, encrypted_note) = self.build(cv_net, nf_old, rng);
+    ) -> Result<crate::pczt::Output, BuildError> {
+        let (note, cmx, encrypted_note) = self.build(cv_net, nf_old, rng)?;
 
-        crate::pczt::Output {
+        Ok(crate::pczt::Output {
             cmx,
             note_version: self.note_version,
             encrypted_note,
@@ -616,7 +654,7 @@ impl OutputInfo {
             zip32_derivation: None,
             user_address: None,
             proprietary: BTreeMap::new(),
-        }
+        })
     }
 }
 
@@ -703,14 +741,14 @@ impl ActionInfo {
         self,
         mut rng: impl Rng,
         circuit_version: OrchardCircuitVersion,
-    ) -> (Action<SigningMetadata>, Circuit) {
+    ) -> Result<(Action<SigningMetadata>, Circuit), BuildError> {
         let v_net = self.value_sum();
         let cv_net = ValueCommitment::derive(v_net, self.rcv.clone());
 
         let (nf_old, ak, alpha, rk) = self.spend.build(&mut rng);
-        let (note, cmx, encrypted_note) = self.output.build(&cv_net, nf_old, &mut rng);
+        let (note, cmx, encrypted_note) = self.output.build(&cv_net, nf_old, &mut rng)?;
 
-        (
+        Ok((
             Action::from_parts(
                 nf_old,
                 rk,
@@ -733,22 +771,22 @@ impl ActionInfo {
                 self.rcv,
                 circuit_version,
             ),
-        )
+        ))
     }
 
-    fn build_for_pczt(self, mut rng: impl Rng) -> crate::pczt::Action {
+    fn build_for_pczt(self, mut rng: impl Rng) -> Result<crate::pczt::Action, BuildError> {
         let v_net = self.value_sum();
         let cv_net = ValueCommitment::derive(v_net, self.rcv.clone());
 
         let spend = self.spend.into_pczt(&mut rng);
-        let output = self.output.into_pczt(&cv_net, spend.nullifier, &mut rng);
+        let output = self.output.into_pczt(&cv_net, spend.nullifier, &mut rng)?;
 
-        crate::pczt::Action {
+        Ok(crate::pczt::Action {
             cv_net,
             spend,
             output,
             rcv: Some(self.rcv),
-        }
+        })
     }
 }
 
@@ -1037,6 +1075,60 @@ impl Builder {
         Ok(())
     }
 
+    /// Adds an address which will receive funds in this transaction, in a note built from
+    /// the given `rseed` instead of a freshly sampled one.
+    ///
+    /// The note's $\psi$, $\mathsf{rcm}$ and $\mathsf{esk}$ are derived from `rseed` as for
+    /// any other note, so the output is an ordinary one to its recipient: it decrypts and
+    /// validates under [ZIP 212] and [ZIP 2005], and a PCZT carries it in its existing
+    /// `rseed` field. What changes is that the note commitment becomes a function of a
+    /// seed the caller chose, which lets a caller commit to data of its own.
+    ///
+    /// # Caveats
+    ///
+    /// This departs from [ZIP 212], which requires the sender to sample `rseed` uniformly
+    /// at random, and it removes the protections that randomness provides:
+    ///
+    /// - Anyone who knows `rseed` can derive the output's $\mathsf{esk}$ and, with the
+    ///   recipient's address, decrypt the note and its memo. Supply a seed that others can
+    ///   compute only for a note whose contents are public; otherwise derive it from a
+    ///   secret with at least 256 bits of entropy.
+    /// - The note encryption key depends only on `rseed`, the recipient, and the nullifier
+    ///   of the note spent in the same action. A caller MUST NOT build two outputs with
+    ///   the same `rseed` and recipient but a different value or memo, unless it knows
+    ///   they cannot share an action's spend; doing so encrypts two plaintexts under one
+    ///   key.
+    ///
+    /// Returns the same errors as [`Builder::add_output`]. [`Builder::build`] and
+    /// [`Builder::build_for_pczt`] return [`BuildError::InvalidOutputNote`] if `rseed` does
+    /// not yield a valid note for the action the output is placed in.
+    ///
+    /// [ZIP 212]: https://zips.z.cash/zip-0212
+    /// [ZIP 2005]: https://zips.z.cash/zip-2005
+    #[cfg(feature = "unstable-bound-notes")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-bound-notes")))]
+    pub fn add_output_with_rseed(
+        &mut self,
+        ovk: Option<OutgoingViewingKey>,
+        recipient: Address,
+        value: NoteValue,
+        memo: [u8; 512],
+        rseed: [u8; 32],
+    ) -> Result<(), OutputError> {
+        if !self.flags.outputs_enabled() {
+            return Err(OutputError::OutputsDisabled);
+        }
+        if !self.flags.cross_address_enabled() {
+            return Err(OutputError::CrossAddressDisabled);
+        }
+
+        self.outputs.push(
+            OutputInfo::new(ovk, recipient, value, self.note_version(), memo).with_rseed(rseed),
+        );
+
+        Ok(())
+    }
+
     /// Adds a wallet-controlled change output, to an address owned by `fvk`.
     ///
     /// This is the only way to retain shielded value in a bundle that disables
@@ -1192,7 +1284,7 @@ impl Builder {
                 let actions = pre_actions
                     .into_iter()
                     .map(|a| a.build_for_pczt(&mut rng))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 Ok((
                     crate::pczt::Bundle {
@@ -1287,6 +1379,8 @@ fn finish_unauthorized_bundle<V: TryFrom<i64>, R: Rng>(
     let (actions, circuits): (Vec<_>, Vec<_>) = pre_actions
         .into_iter()
         .map(|a| a.build(&mut rng, circuit_version))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .unzip();
 
     // Verify that bsk and bvk are consistent.
@@ -3312,5 +3406,214 @@ mod tests {
         let pk = crate::cached_test_keys(OrchardCircuitVersion::PostNu6_3).proving_key();
         let bundle = build_restricted(&mut rng);
         bundle.create_proof(pk, &mut rng).unwrap();
+    }
+
+    /// Outputs whose note is built from a caller-supplied `rseed`.
+    #[cfg(feature = "unstable-bound-notes")]
+    mod supplied_rseed {
+        use proptest::prelude::*;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        use crate::{
+            builder::{Builder, BundleMetadata, BundleType, UnauthorizedBundle},
+            bundle::{testing::arb_bundle_version, BundleVersion, Flags},
+            constants::MERKLE_DEPTH_ORCHARD,
+            keys::{testing::arb_spending_key, FullViewingKey, OutgoingViewingKey, Scope},
+            note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
+            tree::EMPTY_ROOTS,
+            value::{testing::arb_note_value_bounded, NoteValue},
+            Address, Anchor,
+        };
+
+        /// The size in bytes of a note's memo field.
+        const MEMO_SIZE: usize = 512;
+
+        /// Exclusive upper bound on generated output values. The value balance of a bundle
+        /// with one output and no spends is the negated output value, which must fit in an
+        /// `i64`.
+        const OUTPUT_VALUE_BOUND: u64 = i64::MAX as u64;
+
+        /// The builder's index for the single output each test adds.
+        const ONLY_OUTPUT: usize = 0;
+
+        /// One output to be added with a supplied `rseed`, and the key that owns its
+        /// recipient.
+        #[derive(Debug, Clone)]
+        struct SuppliedOutput {
+            fvk: FullViewingKey,
+            recipient: Address,
+            value: NoteValue,
+            memo: [u8; MEMO_SIZE],
+            rseed: [u8; 32],
+            bundle_version: BundleVersion,
+            rng_seed: [u8; 32],
+        }
+
+        impl SuppliedOutput {
+            fn ovk(&self) -> OutgoingViewingKey {
+                self.fvk.to_ovk(Scope::External)
+            }
+
+            fn rng(&self) -> StdRng {
+                StdRng::from_seed(self.rng_seed)
+            }
+
+            /// A builder over the empty-tree anchor holding only this output.
+            fn builder(&self) -> Builder {
+                let mut builder = Builder::new(
+                    BundleType::DEFAULT,
+                    self.bundle_version,
+                    self.bundle_version.default_flags(),
+                    empty_anchor(),
+                )
+                .expect("default flags are representable under their bundle version");
+                builder
+                    .add_output_with_rseed(
+                        Some(self.ovk()),
+                        self.recipient,
+                        self.value,
+                        self.memo,
+                        self.rseed,
+                    )
+                    .expect("the bundle version permits ordinary outputs");
+                builder
+            }
+
+            fn build(&self) -> (UnauthorizedBundle<i64>, BundleMetadata) {
+                self.builder()
+                    .build(self.rng())
+                    .expect("a uniformly random rseed yields a valid note")
+                    .expect("a bundle with an output is not empty")
+            }
+        }
+
+        fn empty_anchor() -> Anchor {
+            EMPTY_ROOTS[MERKLE_DEPTH_ORCHARD].into()
+        }
+
+        prop_compose! {
+            /// Generate an output with a supplied `rseed`, under a bundle version that
+            /// permits ordinary outputs.
+            fn arb_supplied_output()(
+                sk in arb_spending_key(),
+                value in arb_note_value_bounded(OUTPUT_VALUE_BOUND),
+                memo in prop::collection::vec(any::<u8>(), MEMO_SIZE),
+                rseed in prop::array::uniform32(any::<u8>()),
+                bundle_version in arb_bundle_version().prop_filter(
+                    "ordinary outputs require cross-address transfers",
+                    BundleVersion::permits_cross_address_transfers,
+                ),
+                rng_seed in prop::array::uniform32(any::<u8>()),
+            ) -> SuppliedOutput {
+                let fvk = FullViewingKey::from(&sk);
+                SuppliedOutput {
+                    recipient: fvk.address_at(0u32, Scope::External),
+                    fvk,
+                    value,
+                    memo: memo.try_into().expect("the memo strategy generates MEMO_SIZE bytes"),
+                    rseed,
+                    bundle_version,
+                    rng_seed,
+                }
+            }
+        }
+
+        proptest! {
+            /// The recipient decrypts the output with the standard domain and reads back the
+            /// supplied `rseed`.
+            #[test]
+            fn incoming_viewing_key_decrypts_the_supplied_rseed(output in arb_supplied_output()) {
+                let (bundle, meta) = output.build();
+                let decrypted =
+                    bundle.decrypt_outputs_with_keys(&[output.fvk.to_ivk(Scope::External)]);
+
+                prop_assert_eq!(decrypted.len(), 1);
+                let (action_idx, _, note, recipient, memo) = &decrypted[0];
+                prop_assert_eq!(Some(*action_idx), meta.output_action_index(ONLY_OUTPUT));
+                prop_assert_eq!(note.rseed().as_bytes(), &output.rseed);
+                prop_assert_eq!(note.value(), output.value);
+                prop_assert_eq!(recipient, &output.recipient);
+                prop_assert_eq!(memo, &output.memo);
+            }
+
+            /// The sender recovers the output with its outgoing viewing key and reads back the
+            /// supplied `rseed`.
+            #[test]
+            fn outgoing_viewing_key_recovers_the_supplied_rseed(output in arb_supplied_output()) {
+                let (bundle, meta) = output.build();
+                let action_idx = meta.output_action_index(ONLY_OUTPUT).unwrap();
+                let recovered = bundle.recover_output_with_ovk(action_idx, &output.ovk());
+
+                prop_assert!(recovered.is_some());
+                let (note, recipient, memo) = recovered.unwrap();
+                prop_assert_eq!(note.rseed().as_bytes(), &output.rseed);
+                prop_assert_eq!(note.value(), output.value);
+                prop_assert_eq!(recipient, output.recipient);
+                prop_assert_eq!(memo, output.memo);
+            }
+
+            /// A party that knows the recipient, the value and the `rseed` recomputes the
+            /// action's note commitment from the action's nullifier, with no decryption key.
+            #[test]
+            fn commitment_is_recomputable_from_the_supplied_rseed(output in arb_supplied_output()) {
+                let (bundle, meta) = output.build();
+                let action_idx = meta.output_action_index(ONLY_OUTPUT).unwrap();
+                let action = bundle.actions().get(action_idx).unwrap();
+
+                let rho = Rho::from_nf_old(*action.nullifier());
+                let rseed = RandomSeed::from_bytes(output.rseed, &rho).unwrap();
+                let note = Note::from_parts(
+                    output.recipient,
+                    output.value,
+                    rho,
+                    rseed,
+                    output.bundle_version.note_version(),
+                )
+                .unwrap();
+
+                prop_assert_eq!(&ExtractedNoteCommitment::from(note.commitment()), action.cmx());
+            }
+
+            /// A PCZT carries the supplied `rseed` in its existing `rseed` field.
+            #[test]
+            fn pczt_output_carries_the_supplied_rseed(output in arb_supplied_output()) {
+                let (bundle, meta) = output.builder().build_for_pczt(output.rng()).unwrap();
+                let action_idx = meta.output_action_index(ONLY_OUTPUT).unwrap();
+                let rseed = bundle.actions()[action_idx].output().rseed().as_ref();
+
+                prop_assert_eq!(rseed.map(RandomSeed::as_bytes), Some(&output.rseed));
+            }
+
+            /// Supplying an `rseed` changes nothing about when an output may be added.
+            #[test]
+            fn is_rejected_exactly_when_add_output_is(
+                output in arb_supplied_output(),
+                bundle_version in arb_bundle_version(),
+                spends_enabled in any::<bool>(),
+                outputs_enabled in any::<bool>(),
+                cross_address_enabled in any::<bool>(),
+            ) {
+                let flags = Flags::from_parts(spends_enabled, outputs_enabled, cross_address_enabled);
+                let builder =
+                    || Builder::new(BundleType::DEFAULT, bundle_version, flags, empty_anchor());
+                prop_assume!(builder().is_ok());
+
+                let sampled = builder().unwrap().add_output(
+                    Some(output.ovk()),
+                    output.recipient,
+                    output.value,
+                    output.memo,
+                );
+                let supplied = builder().unwrap().add_output_with_rseed(
+                    Some(output.ovk()),
+                    output.recipient,
+                    output.value,
+                    output.memo,
+                    output.rseed,
+                );
+
+                prop_assert_eq!(sampled, supplied);
+            }
+        }
     }
 }
