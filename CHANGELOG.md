@@ -7,6 +7,15 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `orchard::builder::BuildError::{InvalidRandomSeed, InvalidOutputNote}`
+- `unstable-bound-notes` feature flag. The following APIs have been made
+  available behind the `unstable-bound-notes` feature flag, and are not covered
+  by the crate's semver stability guarantees and may change in any future
+  release:
+  - `orchard::builder::Builder::add_output_with_rseed`
+  - `orchard::note::RandomSeedBytes`
+
 ## [0.16.0] - 2026-09-29
 
 ### Added
