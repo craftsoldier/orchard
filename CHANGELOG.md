@@ -15,6 +15,11 @@ and this project adheres to Rust's notion of
   release:
   - `orchard::builder::Builder::add_output_with_rseed`
   - `orchard::note::RandomSeedBytes`
+- `orchard::builder::BuildError::DuplicatePairingKey`
+- `unstable-canonical-pairing` feature flag, which enables `unstable-bound-notes`.
+  The following APIs have been made available behind it, and are not covered by
+  the crate's semver stability guarantees and may change in any future release:
+  - `orchard::builder::Builder::set_canonical_pairing`
 
 ## [0.16.0] - 2026-09-29
 
