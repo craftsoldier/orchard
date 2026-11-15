@@ -36,6 +36,9 @@ use {
     nonempty::NonEmpty,
 };
 
+mod canonical;
+use canonical::CanonicalPairing;
+
 const DEFAULT_MIN_ACTIONS: u8 = 2;
 
 /// An enumeration of rules for Orchard bundle construction.
@@ -211,6 +214,9 @@ pub enum BuildError {
     /// The components of an output with a provided `rseed` do not produce a valid note
     /// commitment.
     InvalidOutputNote,
+    /// Two spends or two outputs of a canonically paired bundle have the same sort key:
+    /// a note is spent twice, or two outputs have the same `rseed`.
+    DuplicatePairingKey,
 }
 
 impl fmt::Display for BuildError {
@@ -266,6 +272,9 @@ impl fmt::Display for BuildError {
             ),
             InvalidOutputNote => f.write_str(
                 "An output with a provided rseed does not produce a valid note commitment.",
+            ),
+            DuplicatePairingKey => f.write_str(
+                "Two spends or two outputs of a canonically paired bundle have the same sort key.",
             ),
         }
     }
@@ -888,6 +897,7 @@ pub struct Builder {
     outputs: Vec<OutputInfo>,
     changes: Vec<ChangeInfo>,
     anchor: BuilderAnchor,
+    canonical: Option<CanonicalPairing>,
 }
 
 /// How a [`Builder`]'s bundle anchor is provided.
@@ -938,6 +948,7 @@ impl Builder {
             outputs: vec![],
             changes: vec![],
             anchor: BuilderAnchor::Fixed(anchor),
+            canonical: None,
         })
     }
 
@@ -1165,6 +1176,42 @@ impl Builder {
         Ok(())
     }
 
+    /// Builds the bundle with canonical action pairing, as the draft ZIP "Canonical Action
+    /// Pairing" specifies, in place of random dummy notes and a random action order.
+    ///
+    /// The dummy notes, the `rseed` of each output added without one, and the order of the
+    /// actions derive from the secret pairing `key`, the application context `ctx`, and the
+    /// nullifiers of the real spends. With the same key, context, spends, outputs and
+    /// bundle type, every build gives the same nullifier, note commitment, `epk` and note
+    /// ciphertext in each action. A bundle built again after a failed broadcast therefore
+    /// keeps every output's ρ and note commitment, which the commitment of an output added
+    /// with [`Builder::add_output_with_rseed`] depends on. Value commitment trapdoors,
+    /// spend authorization randomizers and out-ciphertexts of outputs without an `ovk`
+    /// stay random.
+    ///
+    /// The outputs take their index in the ZIP's derivation from the order in which they
+    /// were added: outputs first, then change outputs.
+    ///
+    /// # Caveats
+    ///
+    /// - The holder of `key` recognizes every dummy spend and dummy output of every bundle
+    ///   built with it, so it learns how many actions are real. Keep `key` with the parties
+    ///   that build or check the bundles, as a viewing key would be kept.
+    /// - Two bundles with no spends and the same `key` and `ctx` share their dummy
+    ///   nullifiers, so at most one of them can be mined. A bundle without spends MUST use
+    ///   a `ctx` unique among the bundles built with `key`.
+    ///
+    /// # Errors
+    ///
+    /// The bundle build returns [`BuildError::CrossAddressDisabled`] if the bundle
+    /// disables cross-address transfers, where ZIP 2006 fixes the pairing, and
+    /// [`BuildError::DuplicatePairingKey`] if two spends or two outputs collide in the
+    /// order.
+    #[cfg_attr(feature = "unstable-canonical-pairing", visibility::make(pub))]
+    pub(crate) fn set_canonical_pairing(&mut self, key: [u8; 32], ctx: &[u8]) {
+        self.canonical = Some(CanonicalPairing::new(key, ctx));
+    }
+
     /// Adds a wallet-controlled change output, to an address owned by `fvk`.
     ///
     /// This is the only way to retain shielded value in a bundle that disables
@@ -1280,7 +1327,7 @@ impl Builder {
             BuilderAnchor::Fixed(anchor) => anchor,
             BuilderAnchor::Deferred => return Err(BuildError::AnchorRequired),
         };
-        bundle(
+        bundle_with(
             rng,
             self.bundle_type,
             self.bundle_version,
@@ -1289,6 +1336,7 @@ impl Builder {
             self.spends,
             self.outputs,
             self.changes,
+            self.canonical.as_ref(),
         )
     }
 
@@ -1315,6 +1363,7 @@ impl Builder {
             self.spends,
             self.outputs,
             self.changes,
+            self.canonical.as_ref(),
             |pre_actions, flags, value_sum, bundle_meta, mut rng| {
                 // Create the actions.
                 let actions = pre_actions
@@ -1364,6 +1413,33 @@ pub fn bundle<V: TryFrom<i64>>(
     outputs: Vec<OutputInfo>,
     changes: Vec<ChangeInfo>,
 ) -> Result<Option<(UnauthorizedBundle<V>, BundleMetadata)>, BuildError> {
+    bundle_with(
+        rng,
+        bundle_type,
+        bundle_version,
+        flags,
+        anchor,
+        spends,
+        outputs,
+        changes,
+        None,
+    )
+}
+
+/// [`bundle`], optionally with canonical action pairing.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "circuit")]
+fn bundle_with<V: TryFrom<i64>>(
+    rng: impl Rng,
+    bundle_type: BundleType,
+    bundle_version: BundleVersion,
+    flags: Flags,
+    anchor: Anchor,
+    spends: Vec<SpendInfo>,
+    outputs: Vec<OutputInfo>,
+    changes: Vec<ChangeInfo>,
+    canonical: Option<&CanonicalPairing>,
+) -> Result<Option<(UnauthorizedBundle<V>, BundleMetadata)>, BuildError> {
     build_bundle(
         rng,
         bundle_version,
@@ -1373,6 +1449,7 @@ pub fn bundle<V: TryFrom<i64>>(
         spends,
         outputs,
         changes,
+        canonical,
         |pre_actions, flags, value_balance, bundle_meta, rng| {
             finish_unauthorized_bundle(
                 pre_actions,
@@ -1456,6 +1533,7 @@ fn build_bundle<B, R: Rng>(
     spends: Vec<SpendInfo>,
     outputs: Vec<OutputInfo>,
     changes: Vec<ChangeInfo>,
+    canonical: Option<&CanonicalPairing>,
     finisher: impl FnOnce(Vec<ActionInfo>, Flags, ValueSum, BundleMetadata, R) -> Result<B, BuildError>,
 ) -> Result<B, BuildError> {
     // Every build path funnels through here (the free `bundle` function, `Builder::build`, and
@@ -1512,6 +1590,11 @@ fn build_bundle<B, R: Rng>(
     let num_actions = bundle_type
         .num_actions(flags, num_requested_spends, num_requested_outputs)
         .map_err(|_| BuildError::BundleTypeNotSatisfiable)?;
+
+    // ZIP 2006 fixes the pairing of a bundle that disables cross-address transfers.
+    if canonical.is_some() && !flags.cross_address_enabled() {
+        return Err(BuildError::CrossAddressDisabled);
+    }
 
     let (pre_actions, bundle_meta) = if !flags.cross_address_enabled() {
         // Every action's output must be addressed to the note it spends, so the
@@ -1607,35 +1690,48 @@ fn build_bundle<B, R: Rng>(
 
         (pre_actions, bundle_meta)
     } else {
-        // Pair up the spends and outputs, extending with dummy values as necessary.
-        let mut indexed_spends = spends
-            .into_iter()
-            .chain(iter::repeat_with(|| {
-                SpendInfo::dummy(note_version, &mut rng)
-            }))
-            .enumerate()
-            .take(num_actions)
-            .collect::<Vec<_>>();
-
         // Plain outputs first, then change outputs collapsed to plain outputs (their
         // ownership was validated when each `ChangeInfo` was constructed and plays no
         // further role when cross-address transfers are permitted). This ordering matches
         // the `BundleMetadata` output numbering.
-        let mut indexed_outputs = outputs
+        let outputs = outputs
             .into_iter()
-            .chain(changes.into_iter().map(ChangeInfo::into_output))
-            .chain(iter::repeat_with(|| {
-                OutputInfo::dummy(note_version, &mut rng)
-            }))
-            .enumerate()
-            .take(num_actions)
-            .collect::<Vec<_>>();
+            .chain(changes.into_iter().map(ChangeInfo::into_output));
 
-        // Shuffle the spends and outputs, so that learning the position of a
-        // specific spent note or output note doesn't reveal anything on its own about
-        // the meaning of that note in the transaction context.
-        indexed_spends.shuffle(&mut rng);
-        indexed_outputs.shuffle(&mut rng);
+        let (indexed_spends, indexed_outputs) = match canonical {
+            Some(canonical) => canonical.pair(
+                note_version,
+                num_actions,
+                spends,
+                outputs.collect(),
+                &mut rng,
+            )?,
+            None => {
+                // Pair up the spends and outputs, extending with dummy values as necessary.
+                let mut indexed_spends = spends
+                    .into_iter()
+                    .chain(iter::repeat_with(|| {
+                        SpendInfo::dummy(note_version, &mut rng)
+                    }))
+                    .enumerate()
+                    .take(num_actions)
+                    .collect::<Vec<_>>();
+                let mut indexed_outputs = outputs
+                    .chain(iter::repeat_with(|| {
+                        OutputInfo::dummy(note_version, &mut rng)
+                    }))
+                    .enumerate()
+                    .take(num_actions)
+                    .collect::<Vec<_>>();
+
+                // Shuffle the spends and outputs, so that learning the position of a
+                // specific spent note or output note doesn't reveal anything on its own
+                // about the meaning of that note in the transaction context.
+                indexed_spends.shuffle(&mut rng);
+                indexed_outputs.shuffle(&mut rng);
+                (indexed_spends, indexed_outputs)
+            }
+        };
 
         let mut bundle_meta = BundleMetadata::new(num_requested_spends, num_requested_outputs);
         let pre_actions = indexed_spends
